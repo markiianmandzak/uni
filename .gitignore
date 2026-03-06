@@ -1,0 +1,60 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+*.egg-info/
+dist/
+build/
+
+# Node
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Electron
+dist/
+out/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Project specific
+config.yml
+test_config.yml
+output/
+tmp/
+downloads/
+*.mp4
+*.ts
+*.m3u8
+geckodriver.log
+
+# Environment
+.env
+.env.*
+.python-version
+
+# Testing
+.pytest_cache/
+*.spec
+
+# Challenge files
+taxonomy/
+test/
+train/
+val/
