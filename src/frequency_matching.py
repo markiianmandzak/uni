@@ -192,8 +192,11 @@ class FrequencyMatcher:
 
 def main():
     """Main execution"""
-    # Test with different thresholds
-    thresholds = [60.0, 70.0, 80.0, 85.0, 90.0, 95.0]
+    import matplotlib.pyplot as plt
+    import numpy as np
+    
+    # Test with different thresholds (50 to 95 with step 5)
+    thresholds = list(range(0, 100, 5))
     
     results = []
     for threshold in thresholds:
@@ -213,6 +216,73 @@ def main():
     print("-"*80)
     for threshold, metrics in results:
         print(f"{threshold:<12.1f} {metrics['accuracy']:<12.2f} {metrics['precision']:<12.2f} {metrics['recall']:<12.2f} {metrics['total_predictions']:<12}")
+    
+    # Plot results
+    print("\n" + "="*80)
+    print("GENERATING VISUALIZATION")
+    print("="*80)
+    
+    thresholds_list = [r[0] for r in results]
+    accuracies = [r[1]['accuracy'] for r in results]
+    precisions = [r[1]['precision'] for r in results]
+    
+    # Calculate F1 score for each threshold (harmonic mean of precision and accuracy)
+    f1_scores = []
+    for p, a in zip(precisions, accuracies):
+        if p + a > 0:
+            f1 = 2 * (p * a) / (p + a)
+        else:
+            f1 = 0
+        f1_scores.append(f1)
+    
+    # Find optimal threshold (max F1 score)
+    optimal_idx = np.argmax(f1_scores)
+    optimal_threshold = thresholds_list[optimal_idx]
+    optimal_accuracy = accuracies[optimal_idx]
+    optimal_precision = precisions[optimal_idx]
+    optimal_f1 = f1_scores[optimal_idx]
+    
+    # Create single plot
+    fig, ax = plt.subplots(figsize=(10, 6))
+    
+    # Plot accuracy and precision
+    ax.plot(thresholds_list, accuracies, 'o-', label='Accuracy (Recall)', linewidth=2.5, markersize=8, color='#2E86AB')
+    ax.plot(thresholds_list, precisions, 's-', label='Precision', linewidth=2.5, markersize=8, color='#A23B72')
+    ax.plot(thresholds_list, f1_scores, '^-', label='F1 Score', linewidth=2.5, markersize=8, color='#F18F01')
+    
+    # Draw vertical line at optimal threshold
+    ax.axvline(x=optimal_threshold, color='red', linestyle='--', linewidth=2, alpha=0.7, label=f'Optimal ({optimal_threshold}%)')
+    
+    # Add text annotation at optimal point
+    ax.text(optimal_threshold + 2, optimal_f1 - 5, 
+            f'Optimal: {optimal_threshold}%\nF1: {optimal_f1:.1f}%\nAcc: {optimal_accuracy:.1f}%\nPrec: {optimal_precision:.1f}%',
+            fontsize=10, bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.9))
+    
+    ax.set_xlabel('Frequency Threshold (%)', fontsize=13, fontweight='bold')
+    ax.set_ylabel('Score (%)', fontsize=13, fontweight='bold')
+    ax.set_title('Frequency Matching: Finding Optimal Threshold via F1 Score', fontsize=15, fontweight='bold')
+    ax.legend(fontsize=11, loc='best')
+    ax.grid(True, alpha=0.3, linestyle='--')
+    ax.set_xlim(-5, 100)
+    ax.set_ylim(0, 105)
+    
+    plt.tight_layout()
+    plt.savefig('frequency_matching_results.png', dpi=150, bbox_inches='tight')
+    print("✓ Saved plot to frequency_matching_results.png")
+    
+    # Report optimal threshold
+    print(f"\n{'='*80}")
+    print(f"OPTIMAL THRESHOLD (Max F1 Score)")
+    print(f"{'='*80}")
+    print(f"Threshold: {optimal_threshold}%")
+    print(f"  F1 Score: {optimal_f1:.2f}%")
+    print(f"  Accuracy: {optimal_accuracy:.2f}%")
+    print(f"  Precision: {optimal_precision:.2f}%")
+    print(f"  Predictions: {results[optimal_idx][1]['total_predictions']}")
+    
+    print(f"\n{'='*80}")
+    print(f"RECOMMENDATION: Use {optimal_threshold}% threshold for best balance")
+    print(f"{'='*80}")
 
 
 if __name__ == '__main__':
