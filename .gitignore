@@ -58,5 +58,7 @@ geckodriver.log
 taxonomy/
 test/
 train/
+train_reshuffled/
+val_reshuffled/
 val/
 data
