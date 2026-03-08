@@ -5,10 +5,27 @@ from collections import Counter, defaultdict
 from functools import lru_cache
 
 import pandas as pd
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.linear_model import SGDClassifier
 from tqdm import tqdm
 
 
 DATA_ROOT = "data/feature-normalization-hackathon/data"
+
+SKLEARN_FALLBACK_FEATURES = {
+    "Ausführung",
+    "Gewinde-Ø",
+    "Material",
+    "Schneidstoff",
+    "Oberfläche",
+    "Antriebsgröße",
+    "Formfaktor",
+    "Antrieb",
+    "Form",
+}
+
+SKLEARN_FALLBACK_MIN_PROB = 0.45
+SKLEARN_FALLBACK_MIN_MARGIN = 0.0
 
 UNIT_PATTERN = r"m³/h|l/min|g/cm³|g/ml|mm²|m²|°C|µm|mm|cm|kg|mg|ml|µl|cl|bar|Hz|V|W|A|m|g|l|L|°|%|\""
 
@@ -477,18 +494,125 @@ def build_mined_categorical_aliases(train_alias_df):
 def extract_mined_alias_value(text, title_text, category, feature_name, rule, mined_aliases):
     entries = mined_aliases.get((category, feature_name), [])
     if not entries:
-        return None
+        return None, None
     for phrase, value, pattern in entries:
         if value not in rule["values"]:
             continue
         if pattern.search(title_text):
-            return value
+            return value, "categorical_alias_exact_title"
     for phrase, value, pattern in entries:
         if value not in rule["values"]:
             continue
         if pattern.search(text):
-            return value
-    return None
+            return value, "categorical_alias_exact_text"
+    return None, None
+
+
+def extract_exact_allowed_value(text, title_text, rule):
+    def normalized_phrase(value):
+        tokens = tokenize_alias_text(value)
+        if not tokens:
+            return None
+        if len(tokens) < 2 and len(" ".join(tokens)) < 8 and not any(char.isdigit() for char in value):
+            return None
+        return " ".join(tokens)
+
+    title_norm = " " + " ".join(tokenize_alias_text(title_text)) + " "
+    text_norm = " " + " ".join(tokenize_alias_text(text)) + " "
+    title_hits = []
+    text_hits = []
+    for value in rule["values"]:
+        phrase = normalized_phrase(value)
+        if not phrase:
+            continue
+        needle = f" {phrase} "
+        if needle in title_norm:
+            title_hits.append(value)
+        if needle in text_norm:
+            text_hits.append(value)
+    if len(title_hits) == 1:
+        return title_hits[0], "categorical_fallback_value_exact_title"
+    if len(text_hits) == 1:
+        return text_hits[0], "categorical_fallback_value_exact_text"
+    return None, None
+
+
+def build_fallback_model_text(category, feature_name, title_text, text):
+    return f"[CAT] {category} [FEAT] {feature_name} [TITLE] {title_text} [TEXT] {text}".strip()
+
+
+def sample_model_training_rows(train_df, max_rows=15000, max_per_label=400, min_count=2):
+    label_counts = train_df["feature_value"].value_counts()
+    keep_labels = set(label_counts[label_counts >= min_count].index)
+    train_df = train_df[train_df["feature_value"].isin(keep_labels)]
+    pieces = []
+    for _, group in train_df.groupby("feature_value", sort=False):
+        if len(group) > max_per_label:
+            group = group.sample(max_per_label, random_state=42)
+        pieces.append(group)
+    if not pieces:
+        return train_df.iloc[0:0].copy()
+    sampled = pd.concat(pieces, ignore_index=True)
+    if len(sampled) > max_rows:
+        sampled = sampled.sample(max_rows, random_state=42)
+    return sampled.reset_index(drop=True)
+
+
+def build_sklearn_fallback_models(train_joined_df):
+    models = {}
+    for feature_name in SKLEARN_FALLBACK_FEATURES:
+        train_sub = train_joined_df[train_joined_df["feature_name"] == feature_name][["category", "feature_name", "title", "description", "feature_value"]].copy()
+        if len(train_sub) < 50 or train_sub["feature_value"].nunique() < 2:
+            continue
+        train_sub = sample_model_training_rows(train_sub)
+        train_texts = [
+            build_fallback_model_text(
+                category,
+                feature_name,
+                normalize_text(title),
+                normalize_text(str(title) + " " + str(description)),
+            )
+            for category, title, description in zip(train_sub["category"], train_sub["title"], train_sub["description"])
+        ]
+        vectorizer = TfidfVectorizer(
+            analyzer="char_wb",
+            ngram_range=(3, 5),
+            min_df=2,
+            max_features=60000,
+            sublinear_tf=True,
+        )
+        X_train = vectorizer.fit_transform(train_texts)
+        clf = SGDClassifier(loss="log_loss", alpha=2e-6, penalty="l2", max_iter=25, tol=1e-3, random_state=42)
+        clf.fit(X_train, train_sub["feature_value"].values)
+        models[feature_name] = {"vectorizer": vectorizer, "clf": clf}
+    return models
+
+
+def choose_allowed_prediction(prob_row, classes, allowed_values):
+    allowed_positions = [index for index, value in enumerate(classes) if value in allowed_values]
+    if not allowed_positions:
+        return None, None, None
+    allowed_probs = prob_row[allowed_positions]
+    order = allowed_probs.argsort()[::-1]
+    best_pos = allowed_positions[order[0]]
+    best_value = classes[best_pos]
+    best_prob = float(prob_row[best_pos])
+    second_prob = float(allowed_probs[order[1]]) if len(order) > 1 else 0.0
+    return best_value, best_prob, best_prob - second_prob
+
+
+def predict_sklearn_fallback_value(text, title_text, category, feature_name, allowed_values, sklearn_fallback_models):
+    if not sklearn_fallback_models or feature_name not in sklearn_fallback_models:
+        return None
+    model_bundle = sklearn_fallback_models[feature_name]
+    model_text = build_fallback_model_text(category, feature_name, title_text, text)
+    prob_row = model_bundle["clf"].predict_proba(model_bundle["vectorizer"].transform([model_text]))[0]
+    value, score, margin = choose_allowed_prediction(prob_row, model_bundle["clf"].classes_, allowed_values)
+    if value is None:
+        return None
+    if score < SKLEARN_FALLBACK_MIN_PROB or margin < SKLEARN_FALLBACK_MIN_MARGIN:
+        return None
+    return value
 
 
 def choose_feature_mode(feature_name, allowed_values, feature_modes):
@@ -498,11 +622,71 @@ def choose_feature_mode(feature_name, allowed_values, feature_modes):
     return allowed_values[0] if allowed_values else None
 
 
+def choose_feature_mode_info(feature_name, allowed_values, feature_modes):
+    ranked = [(candidate, count) for candidate, count in feature_modes.get(feature_name, []) if candidate in allowed_values]
+    if ranked:
+        chosen, top_count = ranked[0]
+        second_count = ranked[1][1] if len(ranked) > 1 else 0
+        strong = top_count >= 20 and (second_count == 0 or top_count >= second_count * 5)
+        return chosen, strong
+    chosen = allowed_values[0] if allowed_values else None
+    return chosen, False
+
+
+def choose_category_feature_mode_info(category, feature_name, allowed_values, category_feature_modes, feature_modes):
+    ranked = [(candidate, count) for candidate, count in category_feature_modes.get((category, feature_name), []) if candidate in allowed_values]
+    if ranked:
+        chosen, top_count = ranked[0]
+        second_count = ranked[1][1] if len(ranked) > 1 else 0
+        strong = top_count >= 3 and (second_count == 0 or top_count >= second_count * 2)
+        return chosen, "category", strong
+    chosen, strong = choose_feature_mode_info(feature_name, allowed_values, feature_modes)
+    return chosen, "global", strong
+
+
 def choose_category_feature_mode(category, feature_name, allowed_values, category_feature_modes, feature_modes):
-    for candidate, _ in category_feature_modes.get((category, feature_name), []):
-        if candidate in allowed_values:
-            return candidate
-    return choose_feature_mode(feature_name, allowed_values, feature_modes)
+    return choose_category_feature_mode_info(category, feature_name, allowed_values, category_feature_modes, feature_modes)[0]
+
+
+def get_match_details(source_text, rule, matched_values):
+    matched_set = set(matched_values)
+    details = {}
+    for value, pattern in rule["patterns"]:
+        if value not in matched_set:
+            continue
+        match = pattern.search(source_text)
+        if not match:
+            continue
+        token_count = len(re.findall(r"[A-Za-z0-9]+", value))
+        candidate = (token_count, match.end() - match.start(), match.start())
+        current = details.get(value)
+        if current is None or candidate[0] > current[0] or (candidate[0] == current[0] and candidate[1] > current[1]) or (candidate[0] == current[0] and candidate[1] == current[1] and candidate[2] < current[2]):
+            details[value] = candidate
+    return details
+
+
+def classify_multi_stage(source_label, source_text, rule, matched_values, predicted_value, category, feature_name, category_feature_modes, feature_modes):
+    details = get_match_details(source_text, rule, matched_values)
+    predicted_detail = details.get(predicted_value)
+    if predicted_detail is not None:
+        competitors = sorted((detail for value, detail in details.items() if value != predicted_value), reverse=True)
+        best_tokens, best_span, best_start = predicted_detail
+        if not competitors:
+            if best_tokens >= 2:
+                return f"categorical_{source_label}_multi_specific"
+            return f"categorical_{source_label}_multi_clear"
+        second_tokens, second_span, second_start = competitors[0]
+        if (best_tokens >= second_tokens + 1 and best_span >= second_span + 4) or (best_tokens >= 3 and best_start + 12 < second_start):
+            return f"categorical_{source_label}_multi_specific"
+        if best_tokens > second_tokens or best_span >= second_span + 4 or (best_start + 8 < second_start and best_tokens >= second_tokens):
+            return f"categorical_{source_label}_multi_clear"
+    mode_value, mode_source, strong = choose_category_feature_mode_info(category, feature_name, matched_values, category_feature_modes, feature_modes)
+    if predicted_value == mode_value:
+        if strong:
+            return f"categorical_{source_label}_multi_prior"
+        if mode_source == "global":
+            return f"categorical_{source_label}_multi_global"
+    return f"categorical_{source_label}_multi_hard"
 
 
 def choose_global_feature_mode(feature_name, feature_modes):
@@ -770,6 +954,7 @@ def extract_faecheranzahl_value(text, rule):
 
 def extract_range_value(feature_name, text, rule):
     range_match = None
+    inferred_unit = None
     for pattern in RANGE_PATTERNS:
         range_match = pattern.search(text)
         if range_match:
@@ -779,11 +964,16 @@ def extract_range_value(feature_name, text, rule):
             range_match = pattern.search(text)
             if range_match:
                 break
+        if not range_match and rule["parsed_example"] and canonicalize_unit(rule["parsed_example"][1]) == "g/ml":
+            plain_density = re.search(r'(?i)(\d+(?:[.,]\d+)?)\s*(?:\.\.\.|-|bis|:)\s*(\d+(?:[.,]\d+)?)', text)
+            if plain_density:
+                range_match = plain_density
+                inferred_unit = "g/ml"
     if not range_match:
         return None
     low = float(range_match.group(1).replace(',', '.'))
     high = float(range_match.group(2).replace(',', '.'))
-    unit = canonicalize_unit(range_match.group(3))
+    unit = inferred_unit or canonicalize_unit(range_match.group(3))
     target = None
     if feature_name in {"Spannbereich von", "Messbereich von", "min. Spannbereich", "min. Messbereich"}:
         target = low
@@ -795,6 +985,13 @@ def extract_range_value(feature_name, text, rule):
 
 
 def extract_thread_value(feature_name, text, rule):
+    if feature_name == "Kopfform":
+        if "Pan-Head" in rule["values"] and re.search(r"(?i)pan\s*head|halbrundkopf", combined_text):
+            return "Pan-Head"
+        if "Sechskant" in rule["values"] and re.search(r"(?i)sechskant", combined_text):
+            return "Sechskant"
+        if "Senkkopf" in rule["values"] and re.search(r"(?i)senkkopf", combined_text):
+            return "Senkkopf"
     if feature_name == "Antrieb":
         special_patterns = [
             (re.compile(r"(?i)riemenantrieb"), "Riemenantrieb"),
@@ -1119,6 +1316,7 @@ def extract_special_categorical_value(text, title_text, rule, feature_name):
             if feature_name == "Frontfarbe" and len(ral_hits) >= 2:
                 return ral_hits[1][1]
             return ral_hits[0][1]
+
     if feature_name == "Oberfläche":
         checks = [
             (re.compile(r"(?i)galv(?:anisch)?\s*verzinkt"), "galvanisch verzinkt"),
@@ -1179,6 +1377,7 @@ def extract_special_categorical_value(text, title_text, rule, feature_name):
             return "Alform"
         if "Laschenform" in rule["values"] and re.search(r"(?i)laschenform", text):
             return "Laschenform"
+
     if feature_name == "Anschluss":
         checks = [
             (re.compile(r"(?i)mini\s*displayport"), "Mini Displayport"),
@@ -1241,7 +1440,11 @@ def extract_special_categorical_value(text, title_text, rule, feature_name):
         if value:
             return value
     if feature_name == "Warenzustand":
-        if "Wiederaufbereitet" in rule["values"] and re.search(r"(?i)refurbished|wiederaufbereitet|gebrauchtware", text):
+        if "Neu" in rule["values"] and re.search(r"(?i)\bretail\b|neuware|brandneu|neu\b", combined_text):
+            return "Neu"
+        if "Wiederaufbereitet" in rule["values"] and re.search(r"(?i)refurbished|wiederaufbereitet|gebrauchtware", combined_text):
+            return "Wiederaufbereitet"
+        if "Wiederaufbereitet" in rule["values"] and str(rule.get("category", "")) == "server_ersatzteil_netzwerkkarte":
             return "Wiederaufbereitet"
     if feature_name == "Antrieb":
         special_patterns = [
@@ -1277,7 +1480,7 @@ def extract_special_categorical_value(text, title_text, rule, feature_name):
             if value in rule["values"] and pattern.search(text):
                 return value
     return None
-def extract_categorical_value(text, title_text, rule, category, feature_name, feature_modes, category_feature_modes, mined_aliases):
+def extract_categorical_value(text, title_text, rule, category, feature_name, feature_modes, category_feature_modes, mined_aliases, sklearn_fallback_models):
     if feature_name == "Format":
         format_value = extract_format_value(text, rule)
         if format_value:
@@ -1287,9 +1490,9 @@ def extract_categorical_value(text, title_text, rule, category, feature_name, fe
     if special_value:
         return special_value, "categorical_special"
 
-    alias_value = extract_mined_alias_value(text, title_text, category, feature_name, rule, mined_aliases)
+    alias_value, alias_stage = extract_mined_alias_value(text, title_text, category, feature_name, rule, mined_aliases)
     if alias_value:
-        return alias_value, "categorical_alias"
+        return alias_value, alias_stage
 
     matches = []
     title_matches = []
@@ -1304,6 +1507,7 @@ def extract_categorical_value(text, title_text, rule, category, feature_name, fe
     if len(matches) == 1:
         return matches[0], "categorical_text_unique"
     if title_matches:
+        predicted_value = None
         if feature_name in {"Modell", "Material", "Beschriftung", "Brenngas", "für Modelle von", "Für Modell"}:
             positioned = []
             for value, pattern in rule["patterns"]:
@@ -1313,11 +1517,31 @@ def extract_categorical_value(text, title_text, rule, category, feature_name, fe
                     positioned.append((-token_count, -(match.end() - match.start()), match.start(), value))
             if positioned:
                 positioned.sort()
-                return positioned[0][3], "categorical_title_multi"
-        return choose_category_feature_mode(category, feature_name, title_matches, category_feature_modes, feature_modes), "categorical_title_multi"
+                predicted_value = positioned[0][3]
+        if predicted_value is None:
+            predicted_value = choose_category_feature_mode(category, feature_name, title_matches, category_feature_modes, feature_modes)
+        stage = classify_multi_stage("title", title_text, rule, title_matches, predicted_value, category, feature_name, category_feature_modes, feature_modes)
+        return predicted_value, stage
     if matches:
-        return choose_category_feature_mode(category, feature_name, matches, category_feature_modes, feature_modes), "categorical_text_multi"
-    return choose_category_feature_mode(category, feature_name, rule["values"], category_feature_modes, feature_modes), "categorical_fallback"
+        predicted_value = choose_category_feature_mode(category, feature_name, matches, category_feature_modes, feature_modes)
+        stage = classify_multi_stage("text", text, rule, matches, predicted_value, category, feature_name, category_feature_modes, feature_modes)
+        return predicted_value, stage
+    exact_value, exact_stage = extract_exact_allowed_value(text, title_text, rule)
+    if exact_value:
+        return exact_value, exact_stage
+    predicted_value, mode_source, strong = choose_category_feature_mode_info(category, feature_name, rule["values"], category_feature_modes, feature_modes)
+    if strong:
+        if mode_source == "category":
+            stage = "categorical_fallback_prior_strong_category"
+        else:
+            stage = "categorical_fallback_prior_strong_global"
+        return predicted_value, stage
+    if mode_source == "category":
+        return predicted_value, "categorical_fallback_category_weak"
+    sklearn_value = predict_sklearn_fallback_value(text, title_text, category, feature_name, rule["values"], sklearn_fallback_models)
+    if sklearn_value:
+        return sklearn_value, "categorical_fallback_sklearn"
+    return predicted_value, "categorical_fallback_global"
 
 
 def extract_numeric_value(feature_name, text, measurements, tuple_candidates, rule, feature_modes):
@@ -1381,7 +1605,7 @@ def extract_numeric_value(feature_name, text, measurements, tuple_candidates, ru
     return choose_feature_mode(feature_name, rule["values"], feature_modes), "numeric_fallback"
 
 
-def build_predictions(prod_df, target_df, taxonomy_rules, feature_modes, category_feature_modes, mined_aliases):
+def build_predictions(prod_df, target_df, taxonomy_rules, feature_modes, category_feature_modes, mined_aliases, sklearn_fallback_models):
     merged = target_df.merge(prod_df[["uid", "category", "title", "description"]], on="uid", how="left").reset_index().rename(columns={"index": "row_index"})
     predictions = [None] * len(merged)
     stages = [None] * len(merged)
@@ -1422,7 +1646,7 @@ def build_predictions(prod_df, target_df, taxonomy_rules, feature_modes, categor
 
         signals = product_cache[row.uid]
         if rule["type"] == "categorical":
-            value, stage = extract_categorical_value(signals["text"], signals["title"], rule, row.category, row.feature_name, feature_modes, category_feature_modes, mined_aliases)
+            value, stage = extract_categorical_value(signals["text"], signals["title"], rule, row.category, row.feature_name, feature_modes, category_feature_modes, mined_aliases, sklearn_fallback_models)
         else:
             value, stage = extract_numeric_value(row.feature_name, signals["text"], signals["measurements"], signals["tuples"], rule, feature_modes)
         predictions[row.row_index] = value
@@ -1440,6 +1664,7 @@ def stage_sort_key(stage_name):
 
 
 def main():
+    print("Start")
     parser = argparse.ArgumentParser()
     parser.add_argument("--split", type=str, choices=["val", "test"], default="val")
     parser.add_argument("--sample-size", type=int, default=None)
@@ -1455,6 +1680,7 @@ def main():
     train_joined_df = train_feat_df.merge(train_prod_df, on="uid", how="left")
     category_feature_modes = build_category_feature_modes(train_joined_df[["category", "feature_name", "feature_value"]])
     mined_aliases = build_mined_categorical_aliases(train_joined_df[train_joined_df["feature_name"].isin(ALIAS_FEATURES)][["category", "feature_name", "feature_value", "title"]])
+    sklearn_fallback_models = build_sklearn_fallback_models(train_joined_df)
 
     prod_df = pd.read_parquet(os.path.join(DATA_ROOT, args.split, "products.parquet"))
     if args.split == "test":
@@ -1467,7 +1693,7 @@ def main():
         truth = target_df["feature_value"].copy()
         target_df["feature_value"] = None
 
-    predictions, stages = build_predictions(prod_df, target_df, taxonomy_rules, feature_modes, category_feature_modes, mined_aliases)
+    predictions, stages = build_predictions(prod_df, target_df, taxonomy_rules, feature_modes, category_feature_modes, mined_aliases, sklearn_fallback_models)
     target_df["feature_value"] = predictions
     target_df["prediction_stage"] = stages
     target_df[["uid", "feature_name", "feature_value", "feature_type"]].to_parquet(f"submission_{args.split}.parquet", index=False)
